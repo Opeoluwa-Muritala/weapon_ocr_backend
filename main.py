@@ -1,11 +1,18 @@
 import os
 import base64
 import json
+import os
+import logging
+import requests
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
-from .schemas import ImagePayload, AnalysisResponse
-from .alert import send_email_via_smtp
+from google import genai
+from pydantic import BaseModel
+
+
+logger = logging.getLogger("alert")
+EMAIL_SERVICE_URL = os.getenv("EMAIL_SERVICE_URL")
+
 
 app = FastAPI()
 app.add_middleware(
@@ -16,9 +23,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY", ""))
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL")
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
+
+class ImagePayload(BaseModel):
+    image_base64: str
+
+class AnalysisResponse(BaseModel):
+    weapon_detected: bool
+    gun_detected: bool
+    knife_detected: bool
+    extracted_text: str
+
+
+def send_email_via_smtp(recipient, subject, html_body):
+    """
+    Sends email by calling the FastAPI email microservice.
+    Returns True if successful, False otherwise.
+    """
+    if not EMAIL_SERVICE_URL:
+        logger.error("EMAIL_SERVICE_URL not set in environment variables")
+        return False
+
+    try:
+        response = requests.post(
+            EMAIL_SERVICE_URL,
+            json={
+                "to": recipient,
+                "subject": subject,
+                "html": html_body
+            },
+            timeout=10
+        )
+        res_json = response.json()
+
+        if res_json.get("success"):
+            logger.info(f"Email sent successfully to {recipient} via service")
+            return True
+        else:
+            logger.error(f"Email service returned error: {res_json.get('error')}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Failed to contact email service: {e}")
+        return False
 
 def to_image_part(data_url: str):
     if "," in data_url:
@@ -43,9 +92,12 @@ def build_prompt() -> str:
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(payload: ImagePayload, background_tasks: BackgroundTasks):
     image_part = to_image_part(payload.image_base64)
-    model = genai.GenerativeModel(model_name=MODEL_NAME, generation_config={"response_mime_type": "application/json"})
-    response = model.generate_content([build_prompt(), image_part])
-    raw_text = response.text
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[build_prompt(), image_part],
+        config={"response_mime_type": "application/json"}
+    )
+    raw_text = getattr(response, "text", None) or getattr(response, "output_text", "")
     data = json.loads(raw_text)
     weapon_detected = bool(data.get("weapon_detected", False))
     gun_detected = bool(data.get("gun_detected", False))

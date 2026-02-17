@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-google-generativeai
+google-genai
 SQLAlchemy
 psycopg2-binary
 python-dotenv
