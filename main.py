@@ -1,20 +1,19 @@
 import os
 import base64
 import json
-import os
 import logging
 import requests
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
+from google.genai import types  # Required for safety settings
 from pydantic import BaseModel
-
 
 logger = logging.getLogger("alert")
 EMAIL_SERVICE_URL = os.getenv("EMAIL_SERVICE_URL")
 
-
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,7 +22,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
+# Updated default model to avoid the 404 Not Found error
+MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL")
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
 
@@ -91,34 +91,76 @@ def build_prompt() -> str:
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(payload: ImagePayload, background_tasks: BackgroundTasks):
-    image_part = to_image_part(payload.image_base64)
-    contents = [{"role": "user", "parts": [{"text": build_prompt()}, image_part]}]
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-        config={"response_mime_type": "application/json"}
-    )
-    raw_text = getattr(response, "text", None) or getattr(response, "output_text", "")
-    data = json.loads(raw_text)
-    weapon_detected = bool(data.get("weapon_detected", False))
-    gun_detected = bool(data.get("gun_detected", False))
-    knife_detected = bool(data.get("knife_detected", False))
-    extracted_text = str(data.get("extracted_text", ""))
+    try:
+        image_part = to_image_part(payload.image_base64)
+        contents = [{"role": "user", "parts": [{"text": build_prompt()}, image_part]}]
+        
+        # Lower safety thresholds so the model is allowed to look for weapons
+        safety_settings = [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            )
+        ]
 
-    if weapon_detected and ALERT_EMAIL:
-        subject = "Weapon detected"
-        html_body = (
-            f"<h3>Alert</h3>"
-            f"<p>Weapon detected: {weapon_detected}</p>"
-            f"<p>Gun detected: {gun_detected}</p>"
-            f"<p>Knife detected: {knife_detected}</p>"
-            f"<p>Extracted text:</p><pre>{extracted_text}</pre>"
+        # Use GenerateContentConfig to pass the safety settings and require JSON
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                safety_settings=safety_settings
+            )
         )
-        background_tasks.add_task(send_email_via_smtp, ALERT_EMAIL, subject, html_body)
+        
+        raw_text = getattr(response, "text", None) or getattr(response, "output_text", "")
+        
+        if not raw_text:
+            logger.error("Empty response from Gemini. Possible safety block.")
+            raise ValueError("Empty response received from the vision model. Content may be blocked by safety filters.")
 
-    return AnalysisResponse(
-        weapon_detected=weapon_detected,
-        gun_detected=gun_detected,
-        knife_detected=knife_detected,
-        extracted_text=extracted_text,
-    )
+        # Clean up potential markdown formatting (```json ... ```) before parsing
+        clean_text = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
+        data = json.loads(clean_text)
+        
+        weapon_detected = bool(data.get("weapon_detected", False))
+        gun_detected = bool(data.get("gun_detected", False))
+        knife_detected = bool(data.get("knife_detected", False))
+        extracted_text = str(data.get("extracted_text", ""))
+
+        if weapon_detected and ALERT_EMAIL:
+            subject = "Weapon detected"
+            html_body = (
+                f"<h3>Alert</h3>"
+                f"<p>Weapon detected: {weapon_detected}</p>"
+                f"<p>Gun detected: {gun_detected}</p>"
+                f"<p>Knife detected: {knife_detected}</p>"
+                f"<p>Extracted text:</p><pre>{extracted_text}</pre>"
+            )
+            background_tasks.add_task(send_email_via_smtp, ALERT_EMAIL, subject, html_body)
+
+        return AnalysisResponse(
+            weapon_detected=weapon_detected,
+            gun_detected=gun_detected,
+            knife_detected=knife_detected,
+            extracted_text=extracted_text,
+        )
+
+    except json.JSONDecodeError:
+        logger.error(f"Failed to parse JSON: {raw_text}")
+        raise HTTPException(status_code=500, detail="Invalid JSON format returned from the AI model.")
+    except Exception as e:
+        logger.error(f"Analysis failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
