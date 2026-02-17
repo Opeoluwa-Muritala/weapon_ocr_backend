@@ -3,15 +3,26 @@ import base64
 import json
 import logging
 import requests
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
-from google.genai import types  # Required for safety settings
 from pydantic import BaseModel
+from google import genai
+from google.genai import types
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("alert")
-EMAIL_SERVICE_URL = os.getenv("EMAIL_SERVICE_URL")
 
+# Environment Variables
+EMAIL_SERVICE_URL = os.getenv("EMAIL_SERVICE_URL")
+ALERT_EMAIL = os.getenv("ALERT_EMAIL")
+MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+# Initialize Gemini Client
+client = genai.Client(api_key=GOOGLE_API_KEY)
+
+# Initialize FastAPI App
 app = FastAPI()
 
 app.add_middleware(
@@ -22,11 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Updated default model to avoid the 404 Not Found error
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
-ALERT_EMAIL = os.getenv("ALERT_EMAIL")
-client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", ""))
-
+# ---- Pydantic Models ---- #
 class ImagePayload(BaseModel):
     image_base64: str
 
@@ -36,14 +43,14 @@ class AnalysisResponse(BaseModel):
     knife_detected: bool
     extracted_text: str
 
-
-def send_email_via_smtp(recipient, subject, html_body):
+# ---- Helper Functions ---- #
+def send_email_via_smtp(recipient: str, subject: str, html_body: str) -> bool:
     """
-    Sends email by calling the FastAPI email microservice.
+    Sends email by calling the FastAPI email microservice synchronously.
     Returns True if successful, False otherwise.
     """
     if not EMAIL_SERVICE_URL:
-        logger.error("EMAIL_SERVICE_URL not set in environment variables")
+        logger.error("EMAIL_SERVICE_URL not set in environment variables. Email not sent.")
         return False
 
     try:
@@ -54,12 +61,12 @@ def send_email_via_smtp(recipient, subject, html_body):
                 "subject": subject,
                 "html": html_body
             },
-            timeout=10
+            timeout=10  # avoid hanging the main request
         )
         res_json = response.json()
 
         if res_json.get("success"):
-            logger.info(f"Email sent successfully to {recipient} via service")
+            logger.info(f"Alert email sent successfully to {recipient}")
             return True
         else:
             logger.error(f"Email service returned error: {res_json.get('error')}")
@@ -70,12 +77,14 @@ def send_email_via_smtp(recipient, subject, html_body):
         return False
 
 def to_image_part(data_url: str):
+    """Converts a base64 string/data URL into the format expected by Gemini."""
     if "," in data_url:
         header, b64 = data_url.split(",", 1)
         mime = "image/jpeg" if "image/jpeg" in header or "image/jpg" in header else "image/png"
     else:
         b64 = data_url
         mime = "image/jpeg"
+        
     data = base64.b64decode(b64)
     return {"inline_data": {"mime_type": mime, "data": data}}
 
@@ -89,12 +98,13 @@ def build_prompt() -> str:
         "If no text is readable, extracted_text must be an empty string. "
     )
 
+# ---- API Endpoints ---- #
 @app.post("/analyze", response_model=AnalysisResponse)
-async def analyze(payload: ImagePayload, background_tasks: BackgroundTasks):
+def analyze(payload: ImagePayload):
     try:
         image_part = to_image_part(payload.image_base64)
         contents = [{"role": "user", "parts": [{"text": build_prompt()}, image_part]}]
-        
+
         # Lower safety thresholds so the model is allowed to look for weapons
         safety_settings = [
             types.SafetySetting(
@@ -115,7 +125,7 @@ async def analyze(payload: ImagePayload, background_tasks: BackgroundTasks):
             )
         ]
 
-        # Use GenerateContentConfig to pass the safety settings and require JSON
+        # Call Gemini synchronously
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=contents,
@@ -124,9 +134,9 @@ async def analyze(payload: ImagePayload, background_tasks: BackgroundTasks):
                 safety_settings=safety_settings
             )
         )
-        
+
         raw_text = getattr(response, "text", None) or getattr(response, "output_text", "")
-        
+
         if not raw_text:
             logger.error("Empty response from Gemini. Possible safety block.")
             raise ValueError("Empty response received from the vision model. Content may be blocked by safety filters.")
@@ -134,22 +144,35 @@ async def analyze(payload: ImagePayload, background_tasks: BackgroundTasks):
         # Clean up potential markdown formatting (```json ... ```) before parsing
         clean_text = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
         data = json.loads(clean_text)
-        
+
         weapon_detected = bool(data.get("weapon_detected", False))
         gun_detected = bool(data.get("gun_detected", False))
         knife_detected = bool(data.get("knife_detected", False))
         extracted_text = str(data.get("extracted_text", ""))
 
+        # Trigger email alert directly if a weapon is detected
         if weapon_detected and ALERT_EMAIL:
-            subject = "Weapon detected"
+            # Ensure the image src format is valid for HTML
+            img_src = payload.image_base64
+            if not img_src.startswith("data:image"):
+                img_src = f"data:image/jpeg;base64,{img_src}"
+
+            subject = "URGENT: Weapon Detected"
             html_body = (
-                f"<h3>Alert</h3>"
-                f"<p>Weapon detected: {weapon_detected}</p>"
-                f"<p>Gun detected: {gun_detected}</p>"
-                f"<p>Knife detected: {knife_detected}</p>"
-                f"<p>Extracted text:</p><pre>{extracted_text}</pre>"
+                f"<h3>Security Alert</h3>"
+                f"<p><strong>Weapon detected:</strong> {weapon_detected}</p>"
+                f"<p><strong>Gun detected:</strong> {gun_detected}</p>"
+                f"<p><strong>Knife detected:</strong> {knife_detected}</p>"
+                f"<p><strong>Extracted text from image:</strong></p>"
+                f"<pre>{extracted_text if extracted_text else 'None'}</pre>"
+                f"<hr>"
+                f"<h4>Snapshot Image:</h4>"
+                f'<img src="{img_src}" alt="Security Snapshot" style="max-width: 600px; height: auto; border: 2px solid #ff0000; border-radius: 5px;"/>'
             )
-            background_tasks.add_task(send_email_via_smtp, ALERT_EMAIL, subject, html_body)
+            # Sends the email synchronously before returning the response to the user
+            email_success = send_email_via_smtp(ALERT_EMAIL, subject, html_body)
+            if not email_success:
+                logger.warning("Email failed to send, but proceeding to return API response.")
 
         return AnalysisResponse(
             weapon_detected=weapon_detected,
