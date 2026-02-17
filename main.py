@@ -77,7 +77,7 @@ def to_image_part(data_url: str):
         b64 = data_url
         mime = "image/jpeg"
     data = base64.b64decode(b64)
-    return {"mime_type": mime, "data": data}
+    return {"inline_data": {"mime_type": mime, "data": data}}
 
 def build_prompt() -> str:
     return (
@@ -92,9 +92,10 @@ def build_prompt() -> str:
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(payload: ImagePayload, background_tasks: BackgroundTasks):
     image_part = to_image_part(payload.image_base64)
+    contents = [{"role": "user", "parts": [{"text": build_prompt()}, image_part]}]
     response = client.models.generate_content(
         model=MODEL_NAME,
-        contents=[build_prompt(), image_part],
+        contents=contents,
         config={"response_mime_type": "application/json"}
     )
     raw_text = getattr(response, "text", None) or getattr(response, "output_text", "")
